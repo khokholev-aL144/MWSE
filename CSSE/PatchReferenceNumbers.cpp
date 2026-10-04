@@ -57,8 +57,8 @@ namespace se::cs::patch::reference_numbers {
 			try {
 				const auto value = std::stoul(line.substr(separator + 1));
 				auto& state = fileStates[line.substr(0, separator)];
-				state.persisted = std::max<DWORD>(state.persisted, value);
-				state.highest = std::max<DWORD>(state.highest, value);
+				state.persisted = std::max(state.persisted, value);
+				state.highest = std::max(state.highest, value);
 			}
 			catch (std::exception&) {
 				continue;
@@ -71,7 +71,7 @@ namespace se::cs::patch::reference_numbers {
 			return;
 		}
 
-		const auto dirty = std::any_of(fileStates.begin(), fileStates.end(), [](const auto& entry) {
+		const auto dirty = std::ranges::any_of(fileStates, [](const auto& entry) {
 			return entry.second.highest > entry.second.persisted;
 		});
 		if (!dirty) {
@@ -112,11 +112,8 @@ namespace se::cs::patch::reference_numbers {
 	}
 
 	DWORD getNewReferenceNumber(GameFile& file, FileState& state) {
-		DWORD number = std::max(file.lastReferenceNumber, state.highest);
-		do {
-			++number;
-		} while (state.usedThisSave.contains(number));
-
+		// highest is never below any number in usedThisSave, so the next one is always free.
+		const DWORD number = std::max(file.lastReferenceNumber, state.highest) + 1;
 		file.lastReferenceNumber = number;
 		state.usedThisSave.insert(number);
 		state.highest = std::max(state.highest, number);
