@@ -28,6 +28,13 @@ namespace se::cs::patch::reference_numbers {
 	// The CS makes the file it saves to the active file, which may be a new file.
 	GameFile* loadedActiveFile = nullptr;
 
+	// Which plugin a reference was loaded from. The CS reassigns source files when merging plugins.
+	struct LoadOrigin {
+		const GameFile* file;
+		DWORD number;
+	};
+	std::unordered_map<const Reference*, LoadOrigin> loadOrigins;
+
 	std::string getFileKey(const GameFile& file) {
 		std::string key = file.fileName;
 		string::to_lower(key);
@@ -43,13 +50,18 @@ namespace se::cs::patch::reference_numbers {
 		return number != 0 && (number & ModMask) == 0;
 	}
 
-	// New references don't get a source file until they are saved. Saving the loaded plugin under a new name keeps it as the owner.
+	// A plugin's references keep their numbers. References loaded from other plugins don't, since their numbers come
+	// from another plugin. References created in this session belong to the saved plugin.
 	bool isReferenceOwnedByFile(const Reference& reference, const GameFile& file) {
 		if (reference.isFromMaster()) {
 			return false;
 		}
-		const auto source = reference.sourceFile;
-		return source == nullptr || source == &file || source == loadedActiveFile;
+
+		const auto origin = loadOrigins.find(&reference);
+		if (origin == loadOrigins.end() || origin->second.number != static_cast<DWORD>(reference.targetID)) {
+			return true;
+		}
+		return origin->second.file == &file || origin->second.file == loadedActiveFile;
 	}
 
 	DWORD getNewReferenceNumber(GameFile& file, FileState& state) {
@@ -171,6 +183,7 @@ namespace se::cs::patch::reference_numbers {
 		}
 
 		reference->targetID = static_cast<int>(formId);
+		loadOrigins[reference] = { file, formId };
 
 		auto& state = getState(*file);
 		state.highest = std::max(state.highest, formId);
@@ -321,6 +334,10 @@ namespace se::cs::patch::reference_numbers {
 	}
 
 	bool installed = false;
+
+	void onBeforeFilesLoaded() {
+		loadOrigins.clear();
+	}
 
 	void onFilesLoaded(RecordHandler& recordHandler) {
 		if (!installed) {

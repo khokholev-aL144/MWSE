@@ -510,6 +510,7 @@ namespace se::cs {
 
 		const auto CS_RecordHandler_LoadFiles = reinterpret_cast<void(__thiscall*)(RecordHandler*)>(0x501500);
 		void __fastcall PatchOnLoadFiles(RecordHandler* recordHandler) {
+			patch::reference_numbers::onBeforeFilesLoaded();
 			CS_RecordHandler_LoadFiles(recordHandler);
 			metadata::reloadModMetadata();
 			se::cs::dialog::layer_window::loadOrCreateLayers();
