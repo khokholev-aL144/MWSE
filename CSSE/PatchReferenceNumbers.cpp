@@ -52,15 +52,21 @@ namespace se::cs::patch::reference_numbers {
 		return number;
 	}
 
+	// The same check the CS uses when writing a cell's references.
+	bool willBeSaved(const Cell& cell, const Reference& reference, const GameFile& file) {
+		const auto CS_ShouldSaveReference = reinterpret_cast<bool(__cdecl*)(bool, const Reference*, const GameFile*, bool, bool)>(0x40393B);
+		return CS_ShouldSaveReference(cell.isFromMaster(), &reference, &file, false, false);
+	}
+
 	template <typename Func>
-	void forEachReference(const RecordHandler& recordHandler, Func&& func) {
+	void forEachSavedReference(const RecordHandler& recordHandler, const GameFile& file, Func&& func) {
 		for (auto cell : *recordHandler.cells) {
 			if (cell == nullptr) {
 				continue;
 			}
 			for (auto list : { &cell->cellNpcRefs, &cell->cellObjRefs }) {
 				for (auto reference : *list) {
-					if (reference) {
+					if (reference && willBeSaved(*cell, *reference, file)) {
 						func(*reference);
 					}
 				}
@@ -134,7 +140,8 @@ namespace se::cs::patch::reference_numbers {
 
 		auto global = recordHandler.getGlobal(MaxRefIndexGlobal);
 		if (global == nullptr) {
-			global = new GlobalVariable(MaxRefIndexGlobal);
+			// The CS frees globals itself, so allocate with its allocator.
+			global = new (memory::_new(sizeof(GlobalVariable))) GlobalVariable(MaxRefIndexGlobal);
 			global->valueType = 'l';
 			global->sourceFile = &file;
 			recordHandler.globals->push_back(global);
@@ -172,7 +179,7 @@ namespace se::cs::patch::reference_numbers {
 		std::vector<Reference*> needNumbers;
 		size_t duplicates = 0;
 
-		forEachReference(*recordHandler, [&](Reference& reference) {
+		forEachSavedReference(*recordHandler, *file, [&](Reference& reference) {
 			if (isReferenceOwnedByFile(reference, *file)) {
 				if (!hasValidNumber(reference)) {
 					needNumbers.push_back(&reference);
@@ -185,8 +192,8 @@ namespace se::cs::patch::reference_numbers {
 					state.highest = std::max(state.highest, static_cast<DWORD>(reference.targetID));
 				}
 			}
-			else if (!reference.isFromMaster() && reference.getModified()) {
-				// Modified references from other plugins get a new number, as in vanilla.
+			else if (!reference.isFromMaster()) {
+				// References from other plugins get a new number, as in vanilla.
 				state.reserved[&reference] = 0;
 			}
 		});
