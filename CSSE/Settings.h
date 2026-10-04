@@ -258,7 +258,6 @@ namespace se::cs {
 
 		struct ReferenceNumbers {
 			bool preserve = true;
-			bool remember_highest = true;
 
 			void from_toml(const toml::value& v);
 			toml::value into_toml() const;

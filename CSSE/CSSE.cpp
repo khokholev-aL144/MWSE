@@ -513,6 +513,7 @@ namespace se::cs {
 			CS_RecordHandler_LoadFiles(recordHandler);
 			metadata::reloadModMetadata();
 			se::cs::dialog::layer_window::loadOrCreateLayers();
+			patch::reference_numbers::onFilesLoaded(*recordHandler);
 		}
 
 		//

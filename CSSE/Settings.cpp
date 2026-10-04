@@ -558,14 +558,12 @@ namespace se::cs {
 
 	void Settings_t::ReferenceNumbers::from_toml(const toml::value& v) {
 		preserve = toml::find_or(v, "preserve", preserve);
-		remember_highest = toml::find_or(v, "remember_highest", remember_highest);
 	}
 
 	toml::value Settings_t::ReferenceNumbers::into_toml() const {
 		return toml::value(
 			{
 				{ "preserve", preserve },
-				{ "remember_highest", remember_highest },
 			}
 		);
 	}

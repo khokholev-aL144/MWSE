@@ -6,19 +6,21 @@
 #include "Settings.h"
 #include "StringUtil.h"
 
+#include "CSCell.h"
 #include "CSGameFile.h"
+#include "CSGlobalVariable.h"
+#include "CSRecordHandler.h"
 #include "CSReference.h"
 
 namespace se::cs::patch::reference_numbers {
 	constexpr DWORD ModMask = 0xFF000000;
+	constexpr DWORD MaxReferenceNumber = 0x00FFFFFF;
+	constexpr auto MaxRefIndexGlobal = "MWSE_MAX_REF_INDEX";
 
 	struct FileState {
 		DWORD highest = 0;
-		DWORD persisted = 0;
-		std::unordered_set<DWORD> usedThisSave;
-		size_t preservedCount = 0;
-		size_t assignedCount = 0;
-		size_t conflictCount = 0;
+		std::unordered_set<DWORD> writtenThisSave;
+		std::unordered_map<const Reference*, DWORD> reserved;
 	};
 
 	std::unordered_map<std::string, FileState> fileStates;
@@ -33,64 +35,113 @@ namespace se::cs::patch::reference_numbers {
 		return fileStates[getFileKey(file)];
 	}
 
-	//
-	// Persistence of the highest used number per plugin.
-	//
-
-	std::filesystem::path getPersistencePath() {
-		return path::getInstallPath() / "csse_reference_numbers.txt";
+	bool hasValidNumber(const Reference& reference) {
+		const auto number = static_cast<DWORD>(reference.targetID);
+		return number != 0 && (number & ModMask) == 0;
 	}
 
-	void loadPersistedNumbers() {
-		std::ifstream file(getPersistencePath());
-		if (!file.is_open()) {
-			return;
-		}
+	// New references don't get a source file until they are saved.
+	bool isReferenceOwnedByFile(const Reference& reference, const GameFile& file) {
+		return !reference.isFromMaster() && (reference.sourceFile == &file || reference.sourceFile == nullptr);
+	}
 
-		std::string line;
-		while (std::getline(file, line)) {
-			const auto separator = line.find('\t');
-			if (separator == std::string::npos) {
+	DWORD getNewReferenceNumber(GameFile& file, FileState& state) {
+		const DWORD number = std::max(file.lastReferenceNumber, state.highest) + 1;
+		file.lastReferenceNumber = number;
+		state.highest = number;
+		return number;
+	}
+
+	template <typename Func>
+	void forEachReference(const RecordHandler& recordHandler, Func&& func) {
+		for (auto cell : *recordHandler.cells) {
+			if (cell == nullptr) {
 				continue;
 			}
-
-			try {
-				const auto value = std::stoul(line.substr(separator + 1));
-				auto& state = fileStates[line.substr(0, separator)];
-				state.persisted = std::max(state.persisted, value);
-				state.highest = std::max(state.highest, value);
-			}
-			catch (std::exception&) {
-				continue;
+			for (auto list : { &cell->cellNpcRefs, &cell->cellObjRefs }) {
+				for (auto reference : *list) {
+					if (reference) {
+						func(*reference);
+					}
+				}
 			}
 		}
 	}
 
-	void savePersistedNumbers() {
-		if (!settings.reference_numbers.remember_highest) {
-			return;
-		}
+	//
+	// MWSE_MAX_REF_INDEX is read straight from the active plugin, so other plugins' copies don't matter.
+	//
 
-		const auto dirty = std::ranges::any_of(fileStates, [](const auto& entry) {
-			return entry.second.highest > entry.second.persisted;
-		});
-		if (!dirty) {
-			return;
-		}
-
-		std::ofstream file(getPersistencePath(), std::ios::trunc);
+	std::optional<DWORD> readMaxRefIndex(const std::filesystem::path& path) {
+		std::ifstream file(path, std::ios::binary);
 		if (!file.is_open()) {
-			log::stream << "[ReferenceNumbers] Could not write " << getPersistencePath().string() << "." << std::endl;
-			return;
+			return {};
 		}
 
-		for (auto& [key, state] : fileStates) {
-			if (state.highest == 0) {
+		struct RecordHeader {
+			char tag[4];
+			std::uint32_t size;
+			std::uint32_t unknown;
+			std::uint32_t flags;
+		};
+		static_assert(sizeof(RecordHeader) == 16);
+
+		RecordHeader header = {};
+		while (file.read(reinterpret_cast<char*>(&header), sizeof(header))) {
+			if (std::memcmp(header.tag, "GLOB", 4) != 0) {
+				file.seekg(header.size, std::ios::cur);
 				continue;
 			}
-			file << key << '\t' << state.highest << '\n';
-			state.persisted = state.highest;
+
+			std::vector<char> data(header.size);
+			if (!file.read(data.data(), data.size())) {
+				break;
+			}
+
+			std::string_view name;
+			std::optional<float> value;
+			for (size_t i = 0; i + 8 <= data.size();) {
+				std::uint32_t size = 0;
+				std::memcpy(&size, &data[i + 4], sizeof(size));
+				const auto payload = i + 8;
+				if (payload + size > data.size()) {
+					break;
+				}
+
+				if (std::memcmp(&data[i], "NAME", 4) == 0) {
+					name = std::string_view(&data[payload], strnlen(&data[payload], size));
+				}
+				else if (std::memcmp(&data[i], "FLTV", 4) == 0 && size == sizeof(float)) {
+					float f = 0.0f;
+					std::memcpy(&f, &data[payload], sizeof(f));
+					value = f;
+				}
+				i = payload + size;
+			}
+
+			if (string::iequal(name, MaxRefIndexGlobal) && value && *value >= 0.0f && *value <= float(MaxReferenceNumber)) {
+				return static_cast<DWORD>(*value);
+			}
 		}
+
+		return {};
+	}
+
+	void writeMaxRefIndex(RecordHandler& recordHandler, GameFile& file, DWORD highest) {
+		if (highest == 0) {
+			return;
+		}
+
+		auto global = recordHandler.getGlobal(MaxRefIndexGlobal);
+		if (global == nullptr) {
+			global = new GlobalVariable(MaxRefIndexGlobal);
+			global->valueType = 'l';
+			global->sourceFile = &file;
+			recordHandler.globals->push_back(global);
+		}
+
+		global->value = static_cast<float>(highest);
+		global->setModified(true);
 	}
 
 	//
@@ -111,67 +162,70 @@ namespace se::cs::patch::reference_numbers {
 		state.highest = std::max(state.highest, formId);
 	}
 
-	DWORD getNewReferenceNumber(GameFile& file, FileState& state) {
-		// highest is never below any number in usedThisSave, so the next one is always free.
-		const DWORD number = std::max(file.lastReferenceNumber, state.highest) + 1;
-		file.lastReferenceNumber = number;
-		state.usedThisSave.insert(number);
-		state.highest = std::max(state.highest, number);
-		return number;
-	}
+	// Number all of the plugin's references before anything is written, so MWSE_MAX_REF_INDEX is final when globals are saved.
+	void __cdecl OnBeforeSaveGlobals(RecordHandler* recordHandler, GameFile* file) {
+		auto& state = getState(*file);
+		state.writtenThisSave.clear();
+		state.reserved.clear();
 
-	bool isReferenceOwnedByFile(const Reference& reference, const GameFile& file) {
-		return !reference.isFromMaster() && reference.sourceFile == &file;
+		std::unordered_set<DWORD> used;
+		std::vector<Reference*> needNumbers;
+		size_t duplicates = 0;
+
+		forEachReference(*recordHandler, [&](Reference& reference) {
+			if (isReferenceOwnedByFile(reference, *file)) {
+				if (!hasValidNumber(reference)) {
+					needNumbers.push_back(&reference);
+				}
+				else if (!used.insert(static_cast<DWORD>(reference.targetID)).second) {
+					needNumbers.push_back(&reference);
+					duplicates++;
+				}
+				else {
+					state.highest = std::max(state.highest, static_cast<DWORD>(reference.targetID));
+				}
+			}
+			else if (!reference.isFromMaster() && reference.getModified()) {
+				// Modified references from other plugins get a new number, as in vanilla.
+				state.reserved[&reference] = 0;
+			}
+		});
+
+		for (auto reference : needNumbers) {
+			reference->targetID = static_cast<int>(getNewReferenceNumber(*file, state));
+		}
+		for (auto& [reference, number] : state.reserved) {
+			number = getNewReferenceNumber(*file, state);
+		}
+
+		writeMaxRefIndex(*recordHandler, *file, state.highest);
+
+		log::stream << "[ReferenceNumbers] Saving " << file->fileName << ": " << used.size() << " references kept their number, "
+			<< needNumbers.size() << " new numbers assigned (" << duplicates << " duplicates). " << MaxRefIndexGlobal << " = " << state.highest << "." << std::endl;
 	}
 
 	DWORD __cdecl OnSaveReferenceNumber(Reference* reference, GameFile* file, DWORD current, bool vanillaWantsNew) {
 		auto& state = getState(*file);
 
-		if (!isReferenceOwnedByFile(*reference, *file)) {
-			// Master references keep their number. References from other plugins get a new one, as in vanilla.
-			if (vanillaWantsNew || current == 0 || !reference->isFromMaster()) {
-				return getNewReferenceNumber(*file, state);
+		if (isReferenceOwnedByFile(*reference, *file)) {
+			if (hasValidNumber(*reference) && state.writtenThisSave.insert(static_cast<DWORD>(reference->targetID)).second) {
+				return static_cast<DWORD>(reference->targetID);
 			}
+			reference->targetID = static_cast<int>(getNewReferenceNumber(*file, state));
+			state.writtenThisSave.insert(static_cast<DWORD>(reference->targetID));
+			log::stream << "[ReferenceNumbers] Late number " << reference->targetID << " for '" << reference->getObjectID() << "'; " << MaxRefIndexGlobal << " is now out of date." << std::endl;
+			return static_cast<DWORD>(reference->targetID);
+		}
+
+		if (reference->isFromMaster() && !vanillaWantsNew && current != 0) {
 			return current;
 		}
 
-		if (current != 0 && (current & ModMask) == 0) {
-			if (state.usedThisSave.insert(current).second) {
-				state.highest = std::max(state.highest, current);
-				state.preservedCount++;
-				return current;
-			}
-
-			state.conflictCount++;
-			log::stream << "[ReferenceNumbers] Duplicate reference number " << current << " for '" << reference->getObjectID() << "'; assigning a new number." << std::endl;
+		if (const auto reserved = state.reserved.find(reference); reserved != state.reserved.end()) {
+			return reserved->second;
 		}
 
-		const auto number = getNewReferenceNumber(*file, state);
-		reference->targetID = static_cast<int>(number);
-		state.assignedCount++;
-		return number;
-	}
-
-	void __cdecl OnBeginSaveReferences(GameFile* file) {
-		auto& state = getState(*file);
-		state.usedThisSave.clear();
-		state.preservedCount = 0;
-		state.assignedCount = 0;
-		state.conflictCount = 0;
-
-		file->lastReferenceNumber = state.highest;
-	}
-
-	void __cdecl OnEndSaveReferences(GameFile* file) {
-		if (file == nullptr) {
-			return;
-		}
-
-		const auto& state = getState(*file);
-		log::stream << "[ReferenceNumbers] Saved " << file->fileName << ": " << state.preservedCount << " references kept their number, "
-			<< state.assignedCount << " new numbers assigned, " << state.conflictCount << " duplicates fixed. Highest number: " << state.highest << "." << std::endl;
-
-		savePersistedNumbers();
+		return getNewReferenceNumber(*file, state);
 	}
 
 	// Replaces 0x53657A. esi = reference, edi = file, [esp+18h] = FRMR.
@@ -222,28 +276,17 @@ namespace se::cs::patch::reference_numbers {
 		}
 	}
 
-	// Replaces 0x5026EA. ebp = file.
-	__declspec(naked) void PatchBeginSaveReferences() {
+	// Replaces 0x502295, right before globals are saved. esi = record handler, ebp = file.
+	__declspec(naked) void PatchBeforeSaveGlobals() {
 		__asm {
 			push ebp
-			call OnBeginSaveReferences
-			add esp, 0x4
-			push 0x6BD848
-			mov eax, 0x5026F9
-			jmp eax
-		}
-	}
-
-	// Replaces 0x502812. esi = record handler.
-	__declspec(naked) void PatchEndSaveReferences() {
-		__asm {
-			push dword ptr [esi + 0x4]
-			call OnEndSaveReferences
-			add esp, 0x4
-			push 0x6BD7F0
+			push esi
+			call OnBeforeSaveGlobals
+			add esp, 0x8
+			push 0x6BD994
 			mov eax, 0x402BFD
 			call eax
-			mov eax, 0x50281C
+			mov eax, 0x50229F
 			jmp eax
 		}
 	}
@@ -258,6 +301,20 @@ namespace se::cs::patch::reference_numbers {
 		return true;
 	}
 
+	bool installed = false;
+
+	void onFilesLoaded(RecordHandler& recordHandler) {
+		if (!installed || recordHandler.activeFile == nullptr) {
+			return;
+		}
+
+		auto& file = *recordHandler.activeFile;
+		if (const auto value = readMaxRefIndex(path::getDataFilesPath() / file.fileName)) {
+			auto& state = getState(file);
+			state.highest = std::max(state.highest, *value);
+		}
+	}
+
 	void installPatches() {
 		if (!settings.reference_numbers.preserve) {
 			return;
@@ -266,29 +323,19 @@ namespace se::cs::patch::reference_numbers {
 		const bool valid = bytesMatch(0x53657A, { 0x33, 0xC0, 0x89, 0x46, 0x70, 0x89, 0x46, 0x6C, 0x50 })
 			&& bytesMatch(0x53877D, { 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x75, 0x11 })
 			&& bytesMatch(0x538785, { 0x8B, 0x86, 0xEC, 0x04, 0x00, 0x00, 0x40, 0x89, 0x86, 0xEC, 0x04, 0x00, 0x00, 0x89, 0x44, 0x24, 0x10 })
-			&& bytesMatch(0x5026E8, { 0xEB, 0x0A })
-			&& bytesMatch(0x5026EA, { 0xC7, 0x85, 0xEC, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x48, 0xD8, 0x6B, 0x00 })
-			&& bytesMatch(0x502812, { 0x68, 0xF0, 0xD7, 0x6B, 0x00, 0xE8, 0xE1, 0x03, 0xF0, 0xFF });
+			&& bytesMatch(0x502295, { 0x68, 0x94, 0xD9, 0x6B, 0x00, 0xE8, 0x5E, 0x09, 0xF0, 0xFF });
 		if (!valid) {
 			log::stream << "[ReferenceNumbers] Unexpected code in the Construction Set executable. Patch not installed." << std::endl;
 			return;
 		}
 
-		if (settings.reference_numbers.remember_highest) {
-			loadPersistedNumbers();
-		}
-
 		using memory::genJumpUnprotected;
-		using memory::writeByteUnprotected;
 
 		genJumpUnprotected(0x53657A, reinterpret_cast<DWORD>(PatchLoadReference), 0x9);
 		genJumpUnprotected(0x53877D, reinterpret_cast<DWORD>(PatchSaveReferenceNumber), 0x8);
 		genJumpUnprotected(0x538785, reinterpret_cast<DWORD>(PatchSaveNewReferenceNumber), 0x11);
+		genJumpUnprotected(0x502295, reinterpret_cast<DWORD>(PatchBeforeSaveGlobals), 0xA);
 
-		// Route both branches before 0x5026EA through the reset hook.
-		genJumpUnprotected(0x5026EA, reinterpret_cast<DWORD>(PatchBeginSaveReferences), 0xF);
-		writeByteUnprotected(0x5026E9, 0x00);
-
-		genJumpUnprotected(0x502812, reinterpret_cast<DWORD>(PatchEndSaveReferences), 0xA);
+		installed = true;
 	}
 }
