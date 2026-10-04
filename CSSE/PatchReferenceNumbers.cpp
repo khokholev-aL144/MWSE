@@ -25,6 +25,9 @@ namespace se::cs::patch::reference_numbers {
 
 	std::unordered_map<std::string, FileState> fileStates;
 
+	// The CS makes the file it saves to the active file, which may be a new file.
+	GameFile* loadedActiveFile = nullptr;
+
 	std::string getFileKey(const GameFile& file) {
 		std::string key = file.fileName;
 		string::to_lower(key);
@@ -40,9 +43,13 @@ namespace se::cs::patch::reference_numbers {
 		return number != 0 && (number & ModMask) == 0;
 	}
 
-	// New references don't get a source file until they are saved.
+	// New references don't get a source file until they are saved. Saving the loaded plugin under a new name keeps it as the owner.
 	bool isReferenceOwnedByFile(const Reference& reference, const GameFile& file) {
-		return !reference.isFromMaster() && (reference.sourceFile == &file || reference.sourceFile == nullptr);
+		if (reference.isFromMaster()) {
+			return false;
+		}
+		const auto source = reference.sourceFile;
+		return source == nullptr || source == &file || source == loadedActiveFile;
 	}
 
 	DWORD getNewReferenceNumber(GameFile& file, FileState& state) {
@@ -173,10 +180,13 @@ namespace se::cs::patch::reference_numbers {
 	void __cdecl OnBeforeSaveGlobals(RecordHandler* recordHandler, GameFile* file) {
 		auto& state = getState(*file);
 		state.writtenThisSave.clear();
-		state.reserved.clear();
+		if (loadedActiveFile && loadedActiveFile != file) {
+			state.highest = std::max(state.highest, getState(*loadedActiveFile).highest);
+		}
 
 		std::unordered_set<DWORD> used;
 		std::vector<Reference*> needNumbers;
+		std::vector<const Reference*> needReserved;
 		size_t duplicates = 0;
 
 		forEachSavedReference(*recordHandler, *file, [&](Reference& reference) {
@@ -193,16 +203,18 @@ namespace se::cs::patch::reference_numbers {
 				}
 			}
 			else if (!reference.isFromMaster()) {
-				// References from other plugins get a new number, as in vanilla.
-				state.reserved[&reference] = 0;
+				// References from other plugins get a new number, as in vanilla. Keep it for the rest of the session.
+				if (state.reserved.try_emplace(&reference, 0).second) {
+					needReserved.push_back(&reference);
+				}
 			}
 		});
 
 		for (auto reference : needNumbers) {
 			reference->targetID = static_cast<int>(getNewReferenceNumber(*file, state));
 		}
-		for (auto& [reference, number] : state.reserved) {
-			number = getNewReferenceNumber(*file, state);
+		for (auto reference : needReserved) {
+			state.reserved[reference] = getNewReferenceNumber(*file, state);
 		}
 
 		writeMaxRefIndex(*recordHandler, *file, state.highest);
@@ -311,7 +323,12 @@ namespace se::cs::patch::reference_numbers {
 	bool installed = false;
 
 	void onFilesLoaded(RecordHandler& recordHandler) {
-		if (!installed || recordHandler.activeFile == nullptr) {
+		if (!installed) {
+			return;
+		}
+
+		loadedActiveFile = recordHandler.activeFile;
+		if (loadedActiveFile == nullptr) {
 			return;
 		}
 
