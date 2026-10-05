@@ -65,6 +65,11 @@ namespace se::cs::patch::reference_numbers {
 		return origin->second.file == &file || origin->second.file == loadedActiveFile;
 	}
 
+	bool wasLoadedFromFile(const Reference& reference, const GameFile& file) {
+		const auto origin = loadOrigins.find(&reference);
+		return origin != loadOrigins.end() && origin->second.file == &file && origin->second.number == static_cast<DWORD>(reference.targetID);
+	}
+
 	DWORD getNewReferenceNumber(GameFile& file, FileState& state) {
 		const DWORD number = std::max(file.lastReferenceNumber, state.highest) + 1;
 		file.lastReferenceNumber = number;
@@ -204,9 +209,28 @@ namespace se::cs::patch::reference_numbers {
 		size_t duplicates = 0;
 		size_t keptReserved = 0;
 
+		// Merge to Masters: the master's own references are written with their number as it is,
+		// and the merged plugin's references are added after them.
+		const auto savingMaster = file->getIsMasterFile();
+		const auto mergingIntoMaster = savingMaster && file != loadedActiveFile;
+		if (savingMaster) {
+			if (const auto global = recordHandler->getGlobal(MaxRefIndexGlobal); global && global->sourceFile == file && global->value > 0.0f) {
+				state.highest = std::max(state.highest, static_cast<DWORD>(global->value));
+			}
+			forEachSavedReference(*recordHandler, *file, [&](Reference& reference) {
+				if (reference.isFromMaster() && hasValidNumber(reference)) {
+					used.insert(static_cast<DWORD>(reference.targetID));
+					state.highest = std::max(state.highest, static_cast<DWORD>(reference.targetID));
+				}
+			});
+		}
+
 		forEachSavedReference(*recordHandler, *file, [&](Reference& reference) {
 			if (isReferenceOwnedByFile(reference, *file)) {
-				if (!hasValidNumber(reference)) {
+				if (mergingIntoMaster && !wasLoadedFromFile(reference, *file)) {
+					needNumbers.push_back(&reference);
+				}
+				else if (!hasValidNumber(reference)) {
 					needNumbers.push_back(&reference);
 				}
 				else if (!used.insert(static_cast<DWORD>(reference.targetID)).second) {
@@ -230,6 +254,9 @@ namespace se::cs::patch::reference_numbers {
 
 		for (auto reference : needNumbers) {
 			reference->targetID = static_cast<int>(getNewReferenceNumber(*file, state));
+			if (mergingIntoMaster) {
+				loadOrigins[reference] = { file, static_cast<DWORD>(reference->targetID) };
+			}
 		}
 		for (auto reference : needReserved) {
 			state.reserved[reference] = getNewReferenceNumber(*file, state);
