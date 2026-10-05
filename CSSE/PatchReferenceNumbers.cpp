@@ -103,7 +103,8 @@ namespace se::cs::patch::reference_numbers {
 	// MWSE_MAX_REF_INDEX is read straight from the active plugin, so other plugins' copies don't matter.
 	//
 
-	std::optional<DWORD> readMaxRefIndex(const std::filesystem::path& path) {
+	// CS-saved files store globals right after game settings, so a master's global can be found without reading the whole file.
+	std::optional<DWORD> readMaxRefIndex(const std::filesystem::path& path, bool stopAfterGlobals = false) {
 		std::ifstream file(path, std::ios::binary);
 		if (!file.is_open()) {
 			return {};
@@ -119,6 +120,10 @@ namespace se::cs::patch::reference_numbers {
 
 		RecordHeader header = {};
 		while (file.read(reinterpret_cast<char*>(&header), sizeof(header))) {
+			if (stopAfterGlobals && std::memcmp(header.tag, "TES3", 4) != 0 && std::memcmp(header.tag, "GMST", 4) != 0 && std::memcmp(header.tag, "GLOB", 4) != 0) {
+				break;
+			}
+
 			if (std::memcmp(header.tag, "GLOB", 4) != 0) {
 				file.seekg(header.size, std::ios::cur);
 				continue;
@@ -214,9 +219,6 @@ namespace se::cs::patch::reference_numbers {
 		const auto savingMaster = file->getIsMasterFile();
 		const auto mergingIntoMaster = savingMaster && file != loadedActiveFile;
 		if (savingMaster) {
-			if (const auto global = recordHandler->getGlobal(MaxRefIndexGlobal); global && global->sourceFile == file && global->value > 0.0f) {
-				state.highest = std::max(state.highest, static_cast<DWORD>(global->value));
-			}
 			forEachSavedReference(*recordHandler, *file, [&](Reference& reference) {
 				if (reference.isFromMaster() && hasValidNumber(reference)) {
 					used.insert(static_cast<DWORD>(reference.targetID));
@@ -392,6 +394,18 @@ namespace se::cs::patch::reference_numbers {
 		if (const auto value = readMaxRefIndex(path::getDataFilesPath() / file.fileName)) {
 			auto& state = getState(file);
 			state.highest = std::max(state.highest, *value);
+		}
+
+		// Masters can be merged into, and their global may be overridden by the active plugin's.
+		for (auto i = 0; i < recordHandler.activeModCount; ++i) {
+			const auto master = recordHandler.activeGameFiles[i];
+			if (master == nullptr || master == loadedActiveFile || !master->getIsMasterFile()) {
+				continue;
+			}
+			if (const auto value = readMaxRefIndex(path::getDataFilesPath() / master->fileName, true)) {
+				auto& state = getState(*master);
+				state.highest = std::max(state.highest, *value);
+			}
 		}
 	}
 
