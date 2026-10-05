@@ -21,6 +21,7 @@ namespace se::cs::patch::reference_numbers {
 		DWORD highest = 0;
 		std::unordered_set<DWORD> writtenThisSave;
 		std::unordered_map<const Reference*, DWORD> reserved;
+		bool logged = false;
 	};
 
 	std::unordered_map<std::string, FileState> fileStates;
@@ -201,6 +202,7 @@ namespace se::cs::patch::reference_numbers {
 		std::vector<Reference*> needNumbers;
 		std::vector<const Reference*> needReserved;
 		size_t duplicates = 0;
+		size_t keptReserved = 0;
 
 		forEachSavedReference(*recordHandler, *file, [&](Reference& reference) {
 			if (isReferenceOwnedByFile(reference, *file)) {
@@ -220,6 +222,9 @@ namespace se::cs::patch::reference_numbers {
 				if (state.reserved.try_emplace(&reference, 0).second) {
 					needReserved.push_back(&reference);
 				}
+				else {
+					keptReserved++;
+				}
 			}
 		});
 
@@ -232,8 +237,15 @@ namespace se::cs::patch::reference_numbers {
 
 		writeMaxRefIndex(*recordHandler, *file, state.highest);
 
-		log::stream << "[ReferenceNumbers] Saving " << file->fileName << ": " << used.size() << " references kept their number, "
-			<< needNumbers.size() << " new numbers assigned (" << duplicates << " duplicates). " << MaxRefIndexGlobal << " = " << state.highest << "." << std::endl;
+		// Only log the first save of a file, and saves that assigned new numbers.
+		const auto assigned = needNumbers.size() + needReserved.size();
+		if (state.logged && assigned == 0) {
+			return;
+		}
+		state.logged = true;
+
+		log::stream << "[ReferenceNumbers] Saving " << file->fileName << ": " << used.size() + keptReserved << " references kept their number, "
+			<< assigned << " new numbers assigned (" << duplicates << " duplicates). " << MaxRefIndexGlobal << " = " << state.highest << "." << std::endl;
 	}
 
 	DWORD __cdecl OnSaveReferenceNumber(Reference* reference, GameFile* file, DWORD current, bool vanillaWantsNew) {
