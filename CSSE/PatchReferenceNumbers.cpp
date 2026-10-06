@@ -14,22 +14,22 @@
 
 namespace se::cs::patch::reference_numbers {
 	constexpr DWORD ModMask = 0xFF000000;
-	constexpr DWORD MaxReferenceNumber = 0x00FFFFFF;
+	// With MWSE's raised plugin limit the game reads only 22 bits of a reference number.
+	constexpr DWORD MaxReferenceNumber = 0x003FFFFF;
 	constexpr auto MaxRefIndexGlobal = "MWSE_MAX_REF_INDEX";
 
 	struct FileState {
 		DWORD highest = 0;
 		std::unordered_set<DWORD> writtenThisSave;
-		std::unordered_map<const Reference*, DWORD> reserved;
 		bool logged = false;
 	};
 
 	std::unordered_map<std::string, FileState> fileStates;
 
-	// The CS makes the file it saves to the active file, which may be a new file.
+	// The file the numbering continues from: the loaded active file, then the last file saved to.
 	GameFile* loadedActiveFile = nullptr;
 
-	// Which plugin a reference was loaded from. The CS reassigns source files when merging plugins.
+	// Which file a reference was loaded from or last saved to. The CS reassigns source files when merging plugins.
 	struct LoadOrigin {
 		const GameFile* file;
 		DWORD number;
@@ -48,7 +48,7 @@ namespace se::cs::patch::reference_numbers {
 
 	bool hasValidNumber(const Reference& reference) {
 		const auto number = static_cast<DWORD>(reference.targetID);
-		return number != 0 && (number & ModMask) == 0;
+		return number != 0 && number <= MaxReferenceNumber;
 	}
 
 	// A plugin's references keep their numbers. References loaded from other plugins don't, since their numbers come
@@ -200,6 +200,15 @@ namespace se::cs::patch::reference_numbers {
 		state.highest = std::max(state.highest, formId);
 	}
 
+	void warnOutOfNumbers(const GameFile& file, size_t count) {
+		std::stringstream message;
+		message << file.fileName << " needs more than " << MaxReferenceNumber << " reference numbers, the most the game can read. "
+			<< "Its " << count << " references were numbered again from the start, as the CS does without this patch. "
+			<< "Saves made with the previous version of this file won't match it.";
+		log::stream << "[ReferenceNumbers] " << message.str() << std::endl;
+		MessageBoxA(NULL, message.str().c_str(), "Reference numbers", MB_OK | MB_ICONWARNING);
+	}
+
 	// Number all of the plugin's references before anything is written, so MWSE_MAX_REF_INDEX is final when globals are saved.
 	void __cdecl OnBeforeSaveGlobals(RecordHandler* recordHandler, GameFile* file) {
 		auto& state = getState(*file);
@@ -209,10 +218,10 @@ namespace se::cs::patch::reference_numbers {
 		}
 
 		std::unordered_set<DWORD> used;
+		std::vector<Reference*> saved;
 		std::vector<Reference*> needNumbers;
-		std::vector<const Reference*> needReserved;
 		size_t duplicates = 0;
-		size_t keptReserved = 0;
+		DWORD masterHighest = 0;
 
 		// Merge to Masters: the master's own references are written with their number as it is,
 		// and the merged plugin's references are added after them.
@@ -222,59 +231,60 @@ namespace se::cs::patch::reference_numbers {
 			forEachSavedReference(*recordHandler, *file, [&](Reference& reference) {
 				if (reference.isFromMaster() && hasValidNumber(reference)) {
 					used.insert(static_cast<DWORD>(reference.targetID));
-					state.highest = std::max(state.highest, static_cast<DWORD>(reference.targetID));
+					masterHighest = std::max(masterHighest, static_cast<DWORD>(reference.targetID));
 				}
 			});
+			state.highest = std::max(state.highest, masterHighest);
 		}
 
 		forEachSavedReference(*recordHandler, *file, [&](Reference& reference) {
-			if (isReferenceOwnedByFile(reference, *file)) {
-				if (mergingIntoMaster && !wasLoadedFromFile(reference, *file)) {
-					needNumbers.push_back(&reference);
-				}
-				else if (!hasValidNumber(reference)) {
-					needNumbers.push_back(&reference);
-				}
-				else if (!used.insert(static_cast<DWORD>(reference.targetID)).second) {
-					needNumbers.push_back(&reference);
-					duplicates++;
-				}
-				else {
-					state.highest = std::max(state.highest, static_cast<DWORD>(reference.targetID));
-				}
+			if (reference.isFromMaster()) {
+				return;
 			}
-			else if (!reference.isFromMaster()) {
-				// References from other plugins get a new number, as in vanilla. Keep it for the rest of the session.
-				if (state.reserved.try_emplace(&reference, 0).second) {
-					needReserved.push_back(&reference);
-				}
-				else {
-					keptReserved++;
-				}
+			saved.push_back(&reference);
+
+			// References from other plugins get a new number, as in vanilla.
+			if (!isReferenceOwnedByFile(reference, *file) || (mergingIntoMaster && !wasLoadedFromFile(reference, *file)) || !hasValidNumber(reference)) {
+				needNumbers.push_back(&reference);
+			}
+			else if (!used.insert(static_cast<DWORD>(reference.targetID)).second) {
+				needNumbers.push_back(&reference);
+				duplicates++;
+			}
+			else {
+				state.highest = std::max(state.highest, static_cast<DWORD>(reference.targetID));
 			}
 		});
 
+		if (std::max(file->lastReferenceNumber, state.highest) + needNumbers.size() > MaxReferenceNumber) {
+			warnOutOfNumbers(*file, saved.size());
+			used.clear();
+			duplicates = 0;
+			file->lastReferenceNumber = masterHighest;
+			state.highest = masterHighest;
+			needNumbers = saved;
+		}
+
 		for (auto reference : needNumbers) {
 			reference->targetID = static_cast<int>(getNewReferenceNumber(*file, state));
-			if (mergingIntoMaster) {
-				loadOrigins[reference] = { file, static_cast<DWORD>(reference->targetID) };
-			}
 		}
-		for (auto reference : needReserved) {
-			state.reserved[reference] = getNewReferenceNumber(*file, state);
+
+		// The numbering continues from the saved file, so saving under another name again keeps these numbers.
+		for (auto reference : saved) {
+			loadOrigins[reference] = { file, static_cast<DWORD>(reference->targetID) };
 		}
+		loadedActiveFile = file;
 
 		writeMaxRefIndex(*recordHandler, *file, state.highest);
 
 		// Only log the first save of a file, and saves that assigned new numbers.
-		const auto assigned = needNumbers.size() + needReserved.size();
-		if (state.logged && assigned == 0) {
+		if (state.logged && needNumbers.empty()) {
 			return;
 		}
 		state.logged = true;
 
-		log::stream << "[ReferenceNumbers] Saving " << file->fileName << ": " << used.size() + keptReserved << " references kept their number, "
-			<< assigned << " new numbers assigned (" << duplicates << " duplicates). " << MaxRefIndexGlobal << " = " << state.highest << "." << std::endl;
+		log::stream << "[ReferenceNumbers] Saving " << file->fileName << ": " << used.size() << " references kept their number, "
+			<< needNumbers.size() << " new numbers assigned (" << duplicates << " duplicates). " << MaxRefIndexGlobal << " = " << state.highest << "." << std::endl;
 	}
 
 	DWORD __cdecl OnSaveReferenceNumber(Reference* reference, GameFile* file, DWORD current, bool vanillaWantsNew) {
@@ -292,10 +302,6 @@ namespace se::cs::patch::reference_numbers {
 
 		if (reference->isFromMaster() && !vanillaWantsNew && current != 0) {
 			return current;
-		}
-
-		if (const auto reserved = state.reserved.find(reference); reserved != state.reserved.end()) {
-			return reserved->second;
 		}
 
 		return getNewReferenceNumber(*file, state);
