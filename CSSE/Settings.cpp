@@ -558,12 +558,14 @@ namespace se::cs {
 
 	void Settings_t::ReferenceNumbers::from_toml(const toml::value& v) {
 		preserve = toml::find_or(v, "preserve", preserve);
+		renumber_when_full = toml::find_or(v, "renumber_when_full", renumber_when_full);
 	}
 
 	toml::value Settings_t::ReferenceNumbers::into_toml() const {
 		return toml::value(
 			{
 				{ "preserve", preserve },
+				{ "renumber_when_full", renumber_when_full },
 			}
 		);
 	}

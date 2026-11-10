@@ -258,6 +258,7 @@ namespace se::cs {
 
 		struct ReferenceNumbers {
 			bool preserve = true;
+			bool renumber_when_full = false;
 
 			void from_toml(const toml::value& v);
 			toml::value into_toml() const;

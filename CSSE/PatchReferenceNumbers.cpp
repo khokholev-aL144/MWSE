@@ -127,6 +127,11 @@ namespace se::cs::patch::reference_numbers {
 		}
 
 		auto global = recordHandler.getGlobal(MaxRefIndexGlobal);
+		if (global && global->valueType != 'l') {
+			log::stream << "[ReferenceNumbers] " << MaxRefIndexGlobal << " already exists and isn't a long. Its value was left as it is, so "
+				<< file.fileName << " doesn't store its highest reference number." << std::endl;
+			return;
+		}
 		if (global == nullptr) {
 			global = new GlobalVariable(MaxRefIndexGlobal);
 			global->valueType = 'l';
@@ -142,9 +147,19 @@ namespace se::cs::patch::reference_numbers {
 	// Hooks.
 	//
 
-	void __cdecl OnLoadReference(Reference* reference, GameFile* file, DWORD formId) {
+	// References that pointed at a master's reference the CS couldn't find, and that it recreated as new references.
+	size_t recreatedMasterReferences = 0;
+
+	void __cdecl OnLoadReference(Reference* reference, GameFile* file, DWORD formId, DWORD masterLink) {
 		reference->sourceID = 0;
 		reference->targetID = 0;
+
+		// The CS has already removed the master index from formId. A recreated master reference keeps no number,
+		// since its number belongs to the master: it gets a new one when saved, as in vanilla.
+		if (masterLink != 0) {
+			recreatedMasterReferences++;
+			return;
+		}
 
 		if (formId == 0 || (formId & ModMask) != 0) {
 			return;
@@ -156,19 +171,44 @@ namespace se::cs::patch::reference_numbers {
 		state.highest = std::max(state.highest, formId);
 	}
 
-	void warnOutOfNumbers(const GameFile& file, size_t count) {
-		std::stringstream message;
-		message << file.fileName << " needs more than " << MaxReferenceNumber << " reference numbers, the most the game can read. "
-			<< "Its " << count << " references were numbered again from the start, as the CS does without this patch. "
-			<< "Saves made with the previous version of this file won't match it.";
-		log::stream << "[ReferenceNumbers] " << message.str() << std::endl;
-		MessageBoxA(NULL, message.str().c_str(), "Reference numbers", MB_OK | MB_ICONWARNING);
+	void showMessage(const std::string& message, UINT icon) {
+		log::stream << "[ReferenceNumbers] " << message << std::endl;
+		MessageBoxA(NULL, message.c_str(), "Reference numbers", MB_OK | icon);
 	}
 
-	// Number all of the plugin's references before anything is written, so MWSE_MAX_REF_INDEX is final when globals are saved.
-	void __cdecl OnBeforeSaveGlobals(RecordHandler* recordHandler, GameFile* file) {
+	void reportOutOfNumbers(const GameFile& file, bool canRenumber) {
+		std::stringstream message;
+		message << "Save cancelled: " << file.fileName << " needs reference numbers above " << MaxReferenceNumber << ", the most the game can read. "
+			<< "The file wasn't changed.";
+		if (canRenumber) {
+			message << "\n\nTo number all of its references again from the start, set renumber_when_full = true in the [reference_numbers] section of csse.toml and save again. "
+				<< "Saved games and plugins made with the current version of this file won't match the renumbered one.";
+		}
+		showMessage(message.str(), MB_ICONERROR);
+	}
+
+	// Late numbers can't be counted in MWSE_MAX_REF_INDEX or cancel the save, so they're reported once a save.
+	bool lateNumberOverLimit = false;
+
+	DWORD getLateReferenceNumber(Reference& reference, GameFile& file, FileState& state) {
+		const auto number = getNewReferenceNumber(file, state);
+		log::stream << "[ReferenceNumbers] Late number " << number << " for '" << reference.getObjectID() << "'; " << MaxRefIndexGlobal << " is now out of date." << std::endl;
+		if (number > MaxReferenceNumber && !lateNumberOverLimit) {
+			lateNumberOverLimit = true;
+			std::stringstream message;
+			message << file.fileName << " was given reference number " << number << ", above " << MaxReferenceNumber << ", the most the game can read. "
+				<< "Don't use this file. Restore it from the backup.";
+			showMessage(message.str(), MB_ICONERROR);
+		}
+		return number;
+	}
+
+	// Number all of the plugin's references before the file is touched, so the save can be cancelled when numbers run out
+	// and MWSE_MAX_REF_INDEX is final when globals are saved. Returns false to cancel the save.
+	bool __cdecl OnBeforeSave(RecordHandler* recordHandler, GameFile* file) {
 		auto& state = getState(*file);
 		state.writtenThisSave.clear();
+		lateNumberOverLimit = false;
 		if (continuedFile && continuedFile != &state) {
 			state.highest = std::max(state.highest, continuedFile->highest);
 		}
@@ -183,11 +223,19 @@ namespace se::cs::patch::reference_numbers {
 		// and the merged plugin's references are added after them.
 		const auto savingMaster = file->getIsMasterFile();
 		const auto mergingIntoMaster = savingMaster && continuedFile != &state;
+		// Master references without a number get one here too, so every number given out is counted before the limit check.
+		std::vector<Reference*> mastersNeedNumbers;
 		if (savingMaster) {
 			forEachSavedReference(*recordHandler, *file, [&](Reference& reference) {
-				if (reference.isFromMaster() && hasValidNumber(reference)) {
+				if (!reference.isFromMaster()) {
+					return;
+				}
+				if (hasValidNumber(reference)) {
 					used.insert(static_cast<DWORD>(reference.targetID));
 					masterHighest = std::max(masterHighest, static_cast<DWORD>(reference.targetID));
+				}
+				else {
+					mastersNeedNumbers.push_back(&reference);
 				}
 			});
 			state.highest = std::max(state.highest, masterHighest);
@@ -212,13 +260,27 @@ namespace se::cs::patch::reference_numbers {
 			}
 		});
 
+		needNumbers.insert(needNumbers.end(), mastersNeedNumbers.begin(), mastersNeedNumbers.end());
 		if (std::max(file->lastReferenceNumber, state.highest) + needNumbers.size() > MaxReferenceNumber) {
-			warnOutOfNumbers(*file, saved.size());
+			// Numbering again from the start reuses numbers that saved games and other plugins may still point at,
+			// so it's only done when asked for, and only when the references fit.
+			const auto canRenumber = masterHighest + saved.size() + mastersNeedNumbers.size() <= MaxReferenceNumber;
+			if (!canRenumber || !settings.reference_numbers.renumber_when_full) {
+				reportOutOfNumbers(*file, canRenumber);
+				return false;
+			}
+
+			std::stringstream message;
+			message << "renumber_when_full is set in csse.toml: all " << saved.size() << " references of " << file->fileName << " are numbered again from the start. "
+				<< "Saved games and plugins made with its previous version won't match it. Set renumber_when_full = false again after this save.";
+			showMessage(message.str(), MB_ICONWARNING);
+
 			used.clear();
 			duplicates = 0;
 			file->lastReferenceNumber = masterHighest;
 			state.highest = masterHighest;
 			needNumbers = saved;
+			needNumbers.insert(needNumbers.end(), mastersNeedNumbers.begin(), mastersNeedNumbers.end());
 		}
 
 		for (auto reference : needNumbers) {
@@ -235,12 +297,13 @@ namespace se::cs::patch::reference_numbers {
 
 		// Only log the first save of a file, and saves that assigned new numbers.
 		if (state.logged && needNumbers.empty()) {
-			return;
+			return true;
 		}
 		state.logged = true;
 
 		log::stream << "[ReferenceNumbers] Saving " << file->fileName << ": " << used.size() << " references kept their number, "
 			<< needNumbers.size() << " new numbers assigned (" << duplicates << " duplicates). " << MaxRefIndexGlobal << " = " << state.highest << "." << std::endl;
+		return true;
 	}
 
 	DWORD __cdecl OnSaveReferenceNumber(Reference* reference, GameFile* file, DWORD current, bool vanillaWantsNew) {
@@ -250,9 +313,8 @@ namespace se::cs::patch::reference_numbers {
 			if (hasValidNumber(*reference) && state.writtenThisSave.insert(static_cast<DWORD>(reference->targetID)).second) {
 				return static_cast<DWORD>(reference->targetID);
 			}
-			reference->targetID = static_cast<int>(getNewReferenceNumber(*file, state));
+			reference->targetID = static_cast<int>(getLateReferenceNumber(*reference, *file, state));
 			state.writtenThisSave.insert(static_cast<DWORD>(reference->targetID));
-			log::stream << "[ReferenceNumbers] Late number " << reference->targetID << " for '" << reference->getObjectID() << "'; " << MaxRefIndexGlobal << " is now out of date." << std::endl;
 			return static_cast<DWORD>(reference->targetID);
 		}
 
@@ -260,18 +322,22 @@ namespace se::cs::patch::reference_numbers {
 			return current;
 		}
 
-		return getNewReferenceNumber(*file, state);
+		return getLateReferenceNumber(*reference, *file, state);
 	}
 
-	// Replaces 0x53657A. esi = reference, edi = file, [esp+18h] = FRMR.
+	// Replaces 0x53657A. esi = reference, edi = file, [esp+18h] = FRMR without its master index.
+	// [esp+13h] is set when the FRMR's master isn't loaded, [esp+28h] holds the FRMR mapped to a loaded master.
 	__declspec(naked) void PatchLoadReference() {
 		__asm {
-			mov eax, [esp + 0x18]
+			movzx eax, byte ptr [esp + 0x13]
+			or eax, [esp + 0x28]
+			push eax
+			mov eax, [esp + 0x1C]
 			push eax
 			push edi
 			push esi
 			call OnLoadReference
-			add esp, 0xC
+			add esp, 0x10
 			xor eax, eax
 			push eax
 			mov ecx, 0x536583
@@ -311,17 +377,23 @@ namespace se::cs::patch::reference_numbers {
 		}
 	}
 
-	// Replaces 0x502295, right before globals are saved. esi = record handler, ebp = file.
-	__declspec(naked) void PatchBeforeSaveGlobals() {
+	// Replaces 0x50214E, right before the backup and the new file are created. esi = record handler, ebp = file.
+	// Cancelling takes the CS's own path for a file that couldn't be created.
+	__declspec(naked) void PatchBeforeSave() {
 		__asm {
 			push ebp
 			push esi
-			call OnBeforeSaveGlobals
+			call OnBeforeSave
 			add esp, 0x8
-			push 0x6BD994
+			test al, al
+			jz cancel
+			push 0x6BDA3C
 			mov eax, 0x402BFD
 			call eax
-			mov eax, 0x50229F
+			mov eax, 0x502158
+			jmp eax
+		cancel:
+			mov eax, 0x50218D
 			jmp eax
 		}
 	}
@@ -354,6 +426,7 @@ namespace se::cs::patch::reference_numbers {
 	void onBeforeFilesLoaded() {
 		continuedFile = nullptr;
 		loadOrigins.clear();
+		recreatedMasterReferences = 0;
 	}
 
 	void onFilesLoaded(RecordHandler& recordHandler) {
@@ -362,6 +435,10 @@ namespace se::cs::patch::reference_numbers {
 		}
 
 		continuedFile = nullptr;
+		if (recreatedMasterReferences != 0) {
+			log::stream << "[ReferenceNumbers] " << recreatedMasterReferences << " references pointed at master references that weren't found. "
+				<< "They were recreated and get new numbers when saved." << std::endl;
+		}
 		if (recordHandler.activeFile == nullptr) {
 			return;
 		}
@@ -377,7 +454,10 @@ namespace se::cs::patch::reference_numbers {
 		const bool valid = bytesMatch(0x53657A, { 0x33, 0xC0, 0x89, 0x46, 0x70, 0x89, 0x46, 0x6C, 0x50 })
 			&& bytesMatch(0x53877D, { 0x8B, 0x44, 0x24, 0x10, 0x85, 0xC0, 0x75, 0x11 })
 			&& bytesMatch(0x538785, { 0x8B, 0x86, 0xEC, 0x04, 0x00, 0x00, 0x40, 0x89, 0x86, 0xEC, 0x04, 0x00, 0x00, 0x89, 0x44, 0x24, 0x10 })
-			&& bytesMatch(0x502295, { 0x68, 0x94, 0xD9, 0x6B, 0x00, 0xE8, 0x5E, 0x09, 0xF0, 0xFF })
+			&& bytesMatch(0x50214E, { 0x68, 0x3C, 0xDA, 0x6B, 0x00, 0xE8, 0xA5, 0x0A, 0xF0, 0xFF })
+			&& bytesMatch(0x50218D, { 0x8B, 0xCE })
+			&& bytesMatch(0x5362C3, { 0x89, 0x7C, 0x24, 0x28 })
+			&& bytesMatch(0x536300, { 0xC6, 0x44, 0x24, 0x13, 0x01 })
 			&& bytesMatch(LoadGlobalVtableEntry, { 0xC8, 0x10, 0x40, 0x00 });
 		if (!valid) {
 			log::stream << "[ReferenceNumbers] Unexpected code in the Construction Set executable. Patch not installed." << std::endl;
@@ -389,7 +469,7 @@ namespace se::cs::patch::reference_numbers {
 		genJumpUnprotected(0x53657A, reinterpret_cast<DWORD>(PatchLoadReference), 0x9);
 		genJumpUnprotected(0x53877D, reinterpret_cast<DWORD>(PatchSaveReferenceNumber), 0x8);
 		genJumpUnprotected(0x538785, reinterpret_cast<DWORD>(PatchSaveNewReferenceNumber), 0x11);
-		genJumpUnprotected(0x502295, reinterpret_cast<DWORD>(PatchBeforeSaveGlobals), 0xA);
+		genJumpUnprotected(0x50214E, reinterpret_cast<DWORD>(PatchBeforeSave), 0xA);
 		memory::writeValueEnforced<DWORD>(LoadGlobalVtableEntry, LoadGlobalOriginal, reinterpret_cast<DWORD>(PatchLoadGlobal));
 
 		installed = true;
